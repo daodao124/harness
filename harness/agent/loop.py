@@ -1,9 +1,13 @@
 
 import json
 import logging
+import math
 import os
+import time
+import asyncio
 
 from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
 from langchain_core.messages import (
     AIMessage,
     SystemMessage,
@@ -87,8 +91,6 @@ async def execute_read_task(
 
     executor = ToolExecutor()
 
-    # Trace every execution attempt.
-    # LangGraph retries this task on transient errors.
     result = await trace_tool_execution(
         tool_name=tool_name,
         tool_call_id=tool_call_id,
@@ -106,7 +108,6 @@ async def execute_read_task(
 
     return result
 
-
 # ===================================
 # Operations Agent
 # ===================================
@@ -118,7 +119,9 @@ class OperationsAgent:
         model: str | None = None,
         max_steps: int = 8,
         llm=None,
+        llm_provider: str | None = None,
         checkpointer=None,
+        max_execution_seconds: float | None = None,
     ):
 
         if max_steps < 1:
@@ -127,27 +130,70 @@ class OperationsAgent:
             )
 
         self.max_steps = max_steps
-
-        # Initialize LLM
-        self.llm = (
-            llm
-            if llm is not None
-            else ChatOpenAI(
-                model=model or os.getenv(
-                    "OPENAI_MODEL",
-                    "gpt-4.1-mini",
-                ),
-                temperature=0,
-                timeout=30,
-                max_retries=1,
-            )
+        self.max_execution_seconds = (
+            max_execution_seconds
+            if max_execution_seconds is not None
+            else float(os.getenv("AGENT_MAX_EXECUTION_SECONDS", "120"))
         )
+        if (
+            not math.isfinite(self.max_execution_seconds)
+            or self.max_execution_seconds <= 0
+        ):
+            raise ValueError(
+                "max_execution_seconds must be a positive finite number"
+            )
+
+        # A supplied model instance takes precedence. Otherwise select the
+        # provider explicitly or through LLM_PROVIDER (api/local).
+        if llm is not None:
+            self.llm = llm
+            self.llm_provider = "custom"
+        else:
+            provider = (
+                llm_provider or os.getenv("LLM_PROVIDER", "api")
+            ).strip().lower()
+
+            if provider in {"api", "openai"}:
+                self.llm_provider = "api"
+                self.llm = ChatOpenAI(
+                    model=model or os.getenv(
+                        "OPENAI_MODEL",
+                        "gpt-4.1-mini",
+                    ),
+                    base_url=os.getenv("OPENAI_BASE_URL") or None,
+                    temperature=0,
+                    timeout=30,
+                    max_retries=1,
+                )
+            elif provider in {"local", "ollama"}:
+                self.llm_provider = "local"
+                self.llm = ChatOllama(
+                    model=model or os.getenv(
+                        "OLLAMA_MODEL",
+                        "qwen3:8b",
+                    ),
+                    base_url=os.getenv(
+                        "OLLAMA_BASE_URL",
+                        "http://localhost:11434",
+                    ),
+                    temperature=0,
+                )
+            else:
+                raise ValueError(
+                    "LLM provider must be 'api' or 'local'."
+                )
 
         # Bind tool definitions
-        self.llm_with_tools = self.llm.bind_tools(
-            get_tool_definitions(),
-            parallel_tool_calls=False,
-        )
+        tool_definitions = get_tool_definitions()
+        if self.llm_provider == "api":
+            self.llm_with_tools = self.llm.bind_tools(
+                tool_definitions,
+                parallel_tool_calls=False,
+            )
+        else:
+            # Ollama does not accept OpenAI's parallel_tool_calls option.
+            # The loop itself rejects responses containing multiple calls.
+            self.llm_with_tools = self.llm.bind_tools(tool_definitions)
 
         # Custom ToolExecutor
         self.executor = ToolExecutor()
@@ -166,6 +212,16 @@ class OperationsAgent:
     # Node 1: Call LLM
     # -----------------------------------
 
+    def initialize_execution(self, state: AgentState) -> dict:
+        """Set one deadline for the run; resumes keep the checkpointed value."""
+        if state.get("deadline_at") is not None:
+            return {}
+        return {
+            "deadline_at": (
+                time.time() + self.max_execution_seconds
+            )
+        }
+
     async def call_llm(
         self,
         state: AgentState,
@@ -173,6 +229,20 @@ class OperationsAgent:
 
         if state["status"] == "waiting_approval":
             return {}
+
+        deadline_at = state.get("deadline_at")
+        remaining = (
+            deadline_at - time.time()
+            if deadline_at is not None
+            else self.max_execution_seconds
+        )
+        if remaining <= 0:
+            return {
+                "status": "failed",
+                "messages": [
+                    AIMessage(content="Execution time limit reached.")
+                ],
+            }
 
         if state["step_count"] >= self.max_steps:
             return {
@@ -192,9 +262,19 @@ class OperationsAgent:
         try:
             # LangGraph + LangChain automatically
             # generate traces when LangSmith is enabled.
-            response = await (
-                self.llm_with_tools.ainvoke(messages)
+            response = await asyncio.wait_for(
+                self.llm_with_tools.ainvoke(messages),
+                timeout=remaining,
             )
+
+        except asyncio.TimeoutError:
+            logger.warning("Agent execution time limit reached during LLM call")
+            return {
+                "status": "failed",
+                "messages": [
+                    AIMessage(content="Execution time limit reached.")
+                ],
+            }
 
         except Exception:
             logger.exception(
@@ -206,6 +286,20 @@ class OperationsAgent:
                 "messages": [
                     AIMessage(
                         content="LLM request failed."
+                    )
+                ],
+            }
+
+        if not isinstance(response, AIMessage):
+            logger.error(
+                "LLM returned an unexpected response type: %s",
+                type(response).__name__,
+            )
+            return {
+                "status": "failed",
+                "messages": [
+                    AIMessage(
+                        content="LLM returned a malformed response."
                     )
                 ],
             }
@@ -301,6 +395,7 @@ class OperationsAgent:
 
         step_count = state["step_count"]
         status = "running"
+        deadline_at = state.get("deadline_at")
 
         def error_result(
             code: str,
@@ -339,6 +434,17 @@ class OperationsAgent:
                 "Maximum tool steps reached.",
             )
 
+            status = "failed"
+
+        elif (
+            deadline_at is not None
+            and deadline_at <= time.time()
+        ):
+
+            result = error_result(
+                "EXECUTION_TIMEOUT",
+                "Agent execution time limit reached.",
+            )
             status = "failed"
 
         # -----------------------------------
@@ -433,48 +539,73 @@ class OperationsAgent:
 
                     # Human approves
                     else:
-
-                        thread_id = (
-                            config.get(
-                                "configurable", {}
-                            ).get("thread_id")
-                        )
-
-                        if not thread_id:
-
+                        if (
+                            deadline_at is not None
+                            and deadline_at <= time.time()
+                        ):
                             result = error_result(
-                                "INVALID_THREAD_ID",
-                                "Thread ID is required.",
+                                "EXECUTION_TIMEOUT",
+                                "Agent execution time limit reached.",
                             )
-
+                            status = "failed"
+                            # Do not issue an approval grant or write after
+                            # the run deadline has elapsed.
                         else:
-
-                            # Stable idempotency key
-                            execution_id = (
-                                f"{thread_id}:{tool_call_id}"
+                            thread_id = (
+                                config.get(
+                                    "configurable", {}
+                                ).get("thread_id")
                             )
 
-                            # Issue one-time approval token
-                            approval_token = (
-                                self.executor.issue_approval(
-                                    tool_name=tool_name,
-                                    arguments=validated_args,
+                            if not thread_id:
+
+                                result = error_result(
+                                    "INVALID_THREAD_ID",
+                                    "Thread ID is required.",
                                 )
-                            )
 
-                            # Execute with LangSmith trace
-                            result = await trace_tool_execution(
-                                tool_name=tool_name,
-                                tool_call_id=tool_call_id,
-                                operation=lambda: (
-                                    self.executor.execute(
+                            else:
+
+                                # Stable idempotency key
+                                execution_id = (
+                                    f"{thread_id}:{tool_call_id}"
+                                )
+
+                                # Issue one-time approval token
+                                approval_token = (
+                                    self.executor.issue_approval(
                                         tool_name=tool_name,
                                         arguments=validated_args,
-                                        approval_token=approval_token,
-                                        execution_id=execution_id,
                                     )
-                                ),
-                            )
+                                )
+
+                                # Execute with LangSmith trace
+                                try:
+                                    result = await asyncio.wait_for(
+                                        trace_tool_execution(
+                                            tool_name=tool_name,
+                                            tool_call_id=tool_call_id,
+                                            operation=lambda: (
+                                                self.executor.execute(
+                                                    tool_name=tool_name,
+                                                    arguments=validated_args,
+                                                    approval_token=approval_token,
+                                                    execution_id=execution_id,
+                                                )
+                                            ),
+                                        ),
+                                        timeout=(
+                                            deadline_at - time.time()
+                                            if deadline_at is not None
+                                            else self.max_execution_seconds
+                                        ),
+                                    )
+                                except asyncio.TimeoutError:
+                                    result = error_result(
+                                        "EXECUTION_TIMEOUT",
+                                        "Agent execution time limit reached.",
+                                    )
+                                    status = "failed"
 
         # -----------------------------------
         # Read Tools + Retry + Tracing
@@ -483,10 +614,18 @@ class OperationsAgent:
         elif tool_name in READ_TOOLS:
 
             try:
-                result = await execute_read_task(
-                    tool_name,
-                    arguments,
-                    tool_call_id,
+                timeout = (
+                    deadline_at - time.time()
+                    if deadline_at is not None
+                    else self.max_execution_seconds
+                )
+                result = await asyncio.wait_for(
+                    execute_read_task(
+                        tool_name,
+                        arguments,
+                        tool_call_id,
+                    ),
+                    timeout=max(0.001, timeout),
                 )
 
             except RetryableToolError as exc:
@@ -496,22 +635,44 @@ class OperationsAgent:
                     "Retry attempts exhausted.",
                 )
 
+            except asyncio.TimeoutError:
+                result = error_result(
+                    "EXECUTION_TIMEOUT",
+                    "Agent execution time limit reached.",
+                )
+                status = "failed"
+
         # -----------------------------------
         # Unknown or Other Tools
         # -----------------------------------
 
         else:
 
-            result = await trace_tool_execution(
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                operation=lambda: (
-                    self.executor.execute(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                    )
-                ),
+            timeout = (
+                deadline_at - time.time()
+                if deadline_at is not None
+                else self.max_execution_seconds
             )
+            try:
+                result = await asyncio.wait_for(
+                    trace_tool_execution(
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                        operation=lambda: (
+                            self.executor.execute(
+                                tool_name=tool_name,
+                                arguments=arguments,
+                            )
+                        ),
+                    ),
+                    timeout=max(0.001, timeout),
+                )
+            except asyncio.TimeoutError:
+                result = error_result(
+                    "EXECUTION_TIMEOUT",
+                    "Agent execution time limit reached.",
+                )
+                status = "failed"
 
         # -----------------------------------
         # Update State
@@ -569,6 +730,11 @@ class OperationsAgent:
         builder = StateGraph(AgentState)
 
         builder.add_node(
+            "initialize_execution",
+            self.initialize_execution,
+        )
+
+        builder.add_node(
             "call_llm",
             self.call_llm,
         )
@@ -580,6 +746,11 @@ class OperationsAgent:
 
         builder.add_edge(
             START,
+            "initialize_execution",
+        )
+
+        builder.add_edge(
+            "initialize_execution",
             "call_llm",
         )
 

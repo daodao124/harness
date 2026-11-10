@@ -28,3 +28,6 @@ class AgentState(MessagesState):
 
     # Proposed tool call awaiting human approval
     pending_approval: dict[str, Any] | None
+
+    # Absolute wall-clock deadline shared by the whole run and resumes
+    deadline_at: float | None
